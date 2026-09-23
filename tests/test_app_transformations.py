@@ -1,153 +1,188 @@
 import unittest
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
 
-from app import build_insumos_export, build_receitas_export
+from app import InputSchemaError, build_insumos_export, build_receitas_export
 
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
 
 class AppTransformationsTest(unittest.TestCase):
-    def test_build_insumos_export_matches_template_columns_and_email(self):
-        email = "isabelleite2020@outlook.com"
+    def test_build_insumos_export_accepts_new_csv_structure(self):
+        source = StringIO(
+            "New Column,INSUMOS,CUSTO,QUANTIDADE,UNIDADE DE MEDIDA\n"
+            ".,Açaí,109,10000,GRAMAS\n"
+            ".,Cereja,\"96,41\",4500,GRAMAS\n"
+            ".,,,,\n"
+        )
 
         result = build_insumos_export(
-            email=email,
-            csv_input=ASSETS_DIR / "insumos_subprodutos.csv",
+            email="Cliente@Example.com",
+            csv_input=source,
             template_xlsx_path=ASSETS_DIR / "insumos.xlsx",
         )
 
-        template_columns = list(pd.read_excel(ASSETS_DIR / "insumos.xlsx").columns)
-        self.assertEqual(list(result.columns), template_columns)
-        self.assertTrue((result["App user email"] == email.lower()).all())
-        self.assertGreater(len(result), 0)
-        self.assertIn("GRAMAS", set(result["UNIDADE DE MEDIDA"].dropna()))
+        self.assertEqual(len(result), 2)
+        self.assertEqual(list(result.columns), list(pd.read_excel(ASSETS_DIR / "insumos.xlsx").columns))
+        self.assertEqual(result["App user email"].tolist(), ["cliente@example.com"] * 2)
+        self.assertEqual(result["INSUMOS"].tolist(), ["Açaí", "Cereja"])
+        self.assertEqual(result["CUSTO"].tolist(), [109, 96.41])
+        self.assertTrue(result["TIPO DE EMBALAGEM"].isna().all())
 
-    def test_build_receitas_export_matches_template_columns_and_fills_first_item_slots(self):
-        email = "Vitoroliveiravfo@gmail.com"
+    def test_build_insumos_export_normalizes_new_units_and_decimal_formats(self):
+        source = StringIO(
+            "INSUMOS,CUSTO,QUANTIDADE,UNIDADE DE MEDIDA\n"
+            "Casquinha,0.22,1,UNIDADES\n"
+            "Farinha,10,1,kg\n"
+            "Leite,8,2,L\n"
+            "Calda,5,250,ml\n"
+        )
+
+        result = build_insumos_export(
+            email="user@test.com",
+            csv_input=source,
+            template_xlsx_path=ASSETS_DIR / "insumos.xlsx",
+        )
+
+        self.assertEqual(result["CUSTO"].tolist(), [0.22, 10, 8, 5])
+        self.assertEqual(result["QUANTIDADE"].tolist(), [1, 1000, 2000, 250])
+        self.assertEqual(
+            result["UNIDADE DE MEDIDA"].tolist(),
+            ["UNIDADES", "GRAMAS", "ML", "ML"],
+        )
+
+    def test_build_receitas_export_accepts_single_new_csv_and_pads_template_slots(self):
+        source = StringIO(
+            "RECEITA,STATUS,PREÇO DE VENDA,RENDIMENTO DA RECEITA,"
+            "INSUMO 1,QND USADA 1,INSUMO 2,QNT USADA 2\n"
+            "Sundae,true,\"7,50\",1,Sorvete,180,Colher,1\n"
+        )
 
         result = build_receitas_export(
-            email=email,
-            csv_input=ASSETS_DIR / "receita_itens.csv",
+            email="Cliente@Example.com",
+            csv_input=source,
             template_xlsx_path=ASSETS_DIR / "receitas modelo.xlsx",
-            receitas_master_path=ASSETS_DIR / "receita_valores.csv",
         )
 
-        template_columns = list(pd.read_excel(ASSETS_DIR / "receitas modelo.xlsx").columns)
-        self.assertEqual(list(result.columns), template_columns)
-        self.assertTrue((result["App user email"] == email.lower()).all())
-        self.assertGreater(len(result), 0)
-        self.assertTrue(result["INSUMO 1"].notna().any())
-        self.assertTrue(result["QND USADA 1"].notna().any())
-        self.assertIn("test duplicar", set(result["RECEITA"].dropna()))
-        self.assertIn(15, set(result["PREÇO DE VENDA"].dropna()))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(
+            list(result.columns),
+            list(pd.read_excel(ASSETS_DIR / "receitas modelo.xlsx").columns),
+        )
+        self.assertEqual(result.loc[0, "App user email"], "cliente@example.com")
+        self.assertEqual(result.loc[0, "RECEITA"], "Sundae")
+        self.assertEqual(result.loc[0, "STATUS"], 1)
+        self.assertEqual(result.loc[0, "PREÇO DE VENDA"], 7.5)
+        self.assertEqual(result.loc[0, "RENDIMENTO DA RECEITA"], 1)
+        self.assertEqual(result.loc[0, "INSUMO 1"], "Sorvete")
+        self.assertEqual(result.loc[0, "QND USADA 1"], 180)
+        self.assertEqual(result.loc[0, "INSUMO 2"], "Colher")
+        self.assertEqual(result.loc[0, "QNT USADA 2"], 1)
+        self.assertTrue(pd.isna(result.loc[0, "INSUMO 25"]))
 
-    def test_build_receitas_export_uses_provided_master_csv(self):
-        itens_df = pd.DataFrame(
-            [
-                {
-                    "receita_id": "abc123",
-                    "itens_id": "item-1",
-                    "quantidade": "2",
-                    "usuario_email": "user@test.com",
-                    "nome": "Farinha",
-                    "insumo_receita_itens": "Farinha",
-                }
-            ]
-        )
-        master_df = pd.DataFrame(
-            [
-                {
-                    "🔒 Row ID": "abc123",
-                    "usuario_email": "user@test.com",
-                    "nome": "Bolo Teste",
-                    "preco_venda": "19,9",
-                    "rendimento_receita": "4",
-                    "status": "1",
-                }
-            ]
-        )
-        itens_path = ASSETS_DIR / "tmp_receitas_itens.csv"
-        master_path = ASSETS_DIR / "tmp_receitas_master.csv"
-        itens_df.to_csv(itens_path, index=False)
-        master_df.to_csv(master_path, index=False)
+    def test_build_insumos_export_reports_missing_required_headers(self):
+        source = StringIO("INSUMOS,CUSTO,QUANTIDADE\nFarinha,10,1\n")
 
         try:
-            result = build_receitas_export(
+            build_insumos_export(
                 email="user@test.com",
-                csv_input=itens_path,
-                template_xlsx_path=ASSETS_DIR / "receitas modelo.xlsx",
-                receitas_master_path=master_path,
+                csv_input=source,
+                template_xlsx_path=ASSETS_DIR / "insumos.xlsx",
             )
-        finally:
-            itens_path.unlink(missing_ok=True)
-            master_path.unlink(missing_ok=True)
+        except Exception as error:
+            self.assertIsInstance(error, InputSchemaError)
+            self.assertEqual(
+                str(error),
+                "Insumos: colunas obrigatórias ausentes: UNIDADE DE MEDIDA",
+            )
+        else:
+            self.fail("build_insumos_export deveria rejeitar headers incompletos")
 
-        self.assertEqual(result.loc[0, "RECEITA"], "Bolo Teste")
-        self.assertEqual(result.loc[0, "PREÇO DE VENDA"], 19.9)
-        self.assertEqual(result.loc[0, "RENDIMENTO DA RECEITA"], 4)
-        self.assertEqual(result.loc[0, "STATUS"], 1)
+    def test_build_receitas_export_rejects_incomplete_ingredient_pair(self):
+        source = StringIO(
+            "RECEITA,STATUS,PREÇO DE VENDA,RENDIMENTO DA RECEITA,INSUMO 1\n"
+            "Sundae,true,7,1,Sorvete\n"
+        )
 
-    def test_build_insumos_export_normalizes_unit_variants_to_canonical_uppercase(self):
+        with self.assertRaisesRegex(
+            InputSchemaError,
+            "Receitas: par incompleto: INSUMO 1 exige QND USADA 1",
+        ):
+            build_receitas_export(
+                email="user@test.com",
+                csv_input=source,
+                template_xlsx_path=ASSETS_DIR / "receitas modelo.xlsx",
+            )
+
+    def test_build_receitas_export_rejects_unknown_status(self):
+        source = StringIO(
+            "RECEITA,STATUS,PREÇO DE VENDA,RENDIMENTO DA RECEITA,"
+            "INSUMO 1,QND USADA 1\n"
+            "Sundae,paused,7,1,Sorvete,180\n"
+        )
+
+        with self.assertRaisesRegex(
+            InputSchemaError,
+            "Receitas: STATUS inválido: paused",
+        ):
+            build_receitas_export(
+                email="user@test.com",
+                csv_input=source,
+                template_xlsx_path=ASSETS_DIR / "receitas modelo.xlsx",
+            )
+
+    def test_find_insumos_warnings_reports_duplicates_without_removing_them(self):
+        try:
+            from app import find_insumos_warnings
+        except ImportError:
+            self.fail("find_insumos_warnings precisa existir")
+
         source_df = pd.DataFrame(
             [
                 {
-                    "usuario_email": "user@test.com",
-                    "nome": "Item A",
-                    "custo": "10,5",
-                    "tipo_embalagem": "pacote",
-                    "quantidade": "1000",
-                    "tipo_unidade_medida": "g",
+                    "INSUMOS": "Casquinha",
+                    "CUSTO": "82",
+                    "QUANTIDADE": "300",
+                    "UNIDADE DE MEDIDA": "UNIDADES",
                 },
                 {
-                    "usuario_email": "user@test.com",
-                    "nome": "Item B",
-                    "custo": "20",
-                    "tipo_embalagem": "",
-                    "quantidade": "1",
-                    "tipo_unidade_medida": "Kilogramas (Kg)",
-                },
-                {
-                    "usuario_email": "user@test.com",
-                    "nome": "Item C",
-                    "custo": "30",
-                    "tipo_embalagem": "",
-                    "quantidade": "250",
-                    "tipo_unidade_medida": "ml",
-                },
-                {
-                    "usuario_email": "user@test.com",
-                    "nome": "Item D",
-                    "custo": "40",
-                    "tipo_embalagem": "",
-                    "quantidade": "3",
-                    "tipo_unidade_medida": "Unidades (pcs)",
+                    "INSUMOS": " casquinha ",
+                    "CUSTO": "0,22",
+                    "QUANTIDADE": "1",
+                    "UNIDADE DE MEDIDA": "UNIDADES",
                 },
             ]
         )
-        source_path = ASSETS_DIR / "tmp_insumos_units.csv"
-        source_df.to_csv(source_path, index=False)
 
+        warnings = find_insumos_warnings(source_df)
+
+        self.assertEqual(warnings, ["Insumos duplicados mantidos: Casquinha."])
+
+    def test_find_receitas_warnings_reports_blank_status(self):
         try:
-            result = build_insumos_export(
-                email="user@test.com",
-                csv_input=source_path,
-                template_xlsx_path=ASSETS_DIR / "insumos.xlsx",
-            )
-        finally:
-            source_path.unlink(missing_ok=True)
+            from app import find_receitas_warnings
+        except ImportError:
+            self.fail("find_receitas_warnings precisa existir")
 
-        self.assertEqual(result.loc[0, "UNIDADE DE MEDIDA"], "GRAMAS")
-        self.assertEqual(result.loc[0, "QUANTIDADE"], 1000)
-        self.assertEqual(result.loc[1, "UNIDADE DE MEDIDA"], "GRAMAS")
-        self.assertEqual(result.loc[1, "QUANTIDADE"], 1000)
-        self.assertEqual(result.loc[2, "UNIDADE DE MEDIDA"], "GRAMAS")
-        self.assertEqual(result.loc[2, "QUANTIDADE"], 250)
-        self.assertEqual(result.loc[3, "UNIDADE DE MEDIDA"], "UNIDADES")
-        self.assertEqual(result.loc[3, "QUANTIDADE"], 3)
+        source_df = pd.DataFrame(
+            [
+                {
+                    "RECEITA": "Casquinha",
+                    "STATUS": pd.NA,
+                    "PREÇO DE VENDA": "4",
+                    "RENDIMENTO DA RECEITA": "1",
+                    "INSUMO 1": "Casquinha",
+                    "QND USADA 1": "1",
+                }
+            ]
+        )
 
+        warnings = find_receitas_warnings(source_df)
+
+        self.assertEqual(warnings, ["Receitas com STATUS vazio: Casquinha."])
 
 if __name__ == "__main__":
     unittest.main()

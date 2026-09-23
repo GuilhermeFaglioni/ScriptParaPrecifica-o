@@ -9,7 +9,6 @@ BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 RECEITAS_TEMPLATE_PATH = ASSETS_DIR / "receitas modelo.xlsx"
 INSUMOS_TEMPLATE_PATH = ASSETS_DIR / "insumos.xlsx"
-RECEITAS_MASTER_PATH = ASSETS_DIR / "receita_valores.csv"
 MAX_RECEITA_ITEMS = 25
 
 APP_TITLE = "Conversor de Planilhas CSV"
@@ -17,6 +16,10 @@ APP_DESCRIPTION = (
     "Busca por email. Recebe CSV no upload e gera planilhas XLSX "
     "na estrutura dos modelos."
 )
+
+
+class InputSchemaError(ValueError):
+    """Raised when an uploaded CSV does not match the supported structure."""
 
 
 def configure_page() -> None:
@@ -52,10 +55,10 @@ UNIT_ALIASES = {
     "quilograma": "QUILOGRAMAS",
     "quilogramas": "QUILOGRAMAS",
     "quilogramas kg": "QUILOGRAMAS",
-    "ml": "MILILITROS",
-    "mililitro": "MILILITROS",
-    "mililitros": "MILILITROS",
-    "mililitros ml": "MILILITROS",
+    "ml": "ML",
+    "mililitro": "ML",
+    "mililitros": "ML",
+    "mililitros ml": "ML",
     "l": "LITROS",
     "litro": "LITROS",
     "litros": "LITROS",
@@ -109,12 +112,13 @@ def normalize_insumo_measure(quantity_value, unit_value):
     if unit == "QUILOGRAMAS":
         return quantity * 1000, "GRAMAS"
 
-    if unit in {"GRAMAS", "MILILITROS", "LITROS"}:
-        if unit == "LITROS":
-            return quantity * 1000, "GRAMAS"
-        return quantity, "GRAMAS"
+    if unit == "LITROS":
+        return quantity * 1000, "ML"
 
-    return quantity, "UNIDADES"
+    if unit in {"GRAMAS", "ML", "UNIDADES"}:
+        return quantity, unit
+
+    return quantity, unit
 
 
 def parse_number(value):
@@ -123,7 +127,14 @@ def parse_number(value):
     text = normalize_text(value)
     if not text:
         return pd.NA
-    text = text.replace(".", "").replace(",", ".")
+    text = text.replace(" ", "")
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
     try:
         number = float(text)
     except ValueError:
@@ -131,6 +142,17 @@ def parse_number(value):
     if number.is_integer():
         return int(number)
     return number
+
+
+def parse_status(value):
+    text = normalize_text(value).lower()
+    if not text:
+        return pd.NA
+    if text in {"true", "1"}:
+        return 1
+    if text in {"false", "0"}:
+        return 0
+    raise InputSchemaError(f"Receitas: STATUS inválido: {normalize_text(value)}")
 
 
 def load_template_columns(template_xlsx_path: Path) -> list[str]:
@@ -151,11 +173,94 @@ def read_csv_input(csv_input) -> pd.DataFrame:
     return pd.read_csv(csv_input, dtype=str)
 
 
-def ensure_columns(dataframe: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    for column in columns:
-        if column not in dataframe.columns:
-            dataframe[column] = pd.NA
-    return dataframe
+def require_columns(
+    dataframe: pd.DataFrame,
+    required_columns: list[str],
+    source_name: str,
+) -> None:
+    missing_columns = [
+        column for column in required_columns if column not in dataframe.columns
+    ]
+    if missing_columns:
+        missing_text = ", ".join(missing_columns)
+        raise InputSchemaError(
+            f"{source_name}: colunas obrigatórias ausentes: {missing_text}"
+        )
+
+
+def validate_receitas_columns(dataframe: pd.DataFrame) -> None:
+    require_columns(
+        dataframe,
+        ["RECEITA", "STATUS", "PREÇO DE VENDA", "RENDIMENTO DA RECEITA"],
+        "Receitas",
+    )
+
+    for index in range(1, MAX_RECEITA_ITEMS + 1):
+        item_column = f"INSUMO {index}"
+        quantity_column = "QND USADA 1" if index == 1 else f"QNT USADA {index}"
+        has_item_column = item_column in dataframe.columns
+        has_quantity_column = quantity_column in dataframe.columns
+        if has_item_column != has_quantity_column:
+            present_column = item_column if has_item_column else quantity_column
+            missing_column = quantity_column if has_item_column else item_column
+            raise InputSchemaError(
+                f"Receitas: par incompleto: {present_column} exige {missing_column}"
+            )
+
+    require_columns(dataframe, ["INSUMO 1", "QND USADA 1"], "Receitas")
+
+
+def find_insumos_warnings(dataframe: pd.DataFrame) -> list[str]:
+    warnings = []
+    names = dataframe["INSUMOS"].fillna("").map(normalize_text)
+    normalized_names = names.str.casefold()
+    duplicate_keys = normalized_names[
+        (normalized_names != "") & normalized_names.duplicated(keep=False)
+    ].drop_duplicates()
+    if not duplicate_keys.empty:
+        duplicate_names = [
+            names[normalized_names == key].iloc[0] for key in duplicate_keys
+        ]
+        warnings.append(
+            f"Insumos duplicados mantidos: {', '.join(duplicate_names)}."
+        )
+
+    business_columns = ["CUSTO", "QUANTIDADE", "UNIDADE DE MEDIDA"]
+    populated_without_name = (names == "") & dataframe[business_columns].apply(
+        lambda column: column.fillna("").map(normalize_text) != ""
+    ).any(axis=1)
+    invalid_count = int(populated_without_name.sum())
+    if invalid_count:
+        warnings.append(
+            f"{invalid_count} linha(s) de insumos sem nome foram ignoradas."
+        )
+
+    return warnings
+
+
+def find_receitas_warnings(dataframe: pd.DataFrame) -> list[str]:
+    warnings = []
+    names = dataframe["RECEITA"].fillna("").map(normalize_text)
+    statuses = dataframe["STATUS"].fillna("").map(normalize_text)
+    blank_status_names = names[(names != "") & (statuses == "")].tolist()
+    if blank_status_names:
+        warnings.append(
+            f"Receitas com STATUS vazio: {', '.join(blank_status_names)}."
+        )
+
+    business_columns = [
+        column for column in dataframe.columns if column != "RECEITA"
+    ]
+    populated_without_name = (names == "") & dataframe[business_columns].apply(
+        lambda column: column.fillna("").map(normalize_text) != ""
+    ).any(axis=1)
+    invalid_count = int(populated_without_name.sum())
+    if invalid_count:
+        warnings.append(
+            f"{invalid_count} linha(s) de receitas sem nome foram ignoradas."
+        )
+
+    return warnings
 
 
 def build_insumos_export(
@@ -165,32 +270,23 @@ def build_insumos_export(
 ) -> pd.DataFrame:
     template_columns = load_template_columns(template_xlsx_path)
     source_df = read_csv_input(csv_input)
-    source_df = ensure_columns(
+    require_columns(
         source_df,
-        [
-            "usuario_email",
-            "nome",
-            "custo",
-            "tipo_embalagem",
-            "quantidade",
-            "tipo_unidade_medida",
-        ],
+        ["INSUMOS", "CUSTO", "QUANTIDADE", "UNIDADE DE MEDIDA"],
+        "Insumos",
     )
-
     filtered_df = source_df[
-        source_df["usuario_email"].fillna("").str.lower() == normalize_email(email)
+        source_df["INSUMOS"].fillna("").map(normalize_text) != ""
     ].copy()
 
-    if filtered_df.empty:
-        return pd.DataFrame(columns=template_columns)
-
-    filtered_df = filtered_df[filtered_df["nome"].notna()].copy()
     filtered_df["App user email"] = normalize_email(email)
-    filtered_df["INSUMOS"] = filtered_df["nome"].map(normalize_text)
-    filtered_df["CUSTO"] = filtered_df["custo"].map(parse_number)
-    filtered_df["TIPO DE EMBALAGEM"] = filtered_df["tipo_embalagem"].map(normalize_text)
+    filtered_df["INSUMOS"] = filtered_df["INSUMOS"].map(normalize_text)
+    filtered_df["CUSTO"] = filtered_df["CUSTO"].map(parse_number)
+    filtered_df["TIPO DE EMBALAGEM"] = pd.NA
     normalized_measure = filtered_df.apply(
-        lambda row: normalize_insumo_measure(row["quantidade"], row["tipo_unidade_medida"]),
+        lambda row: normalize_insumo_measure(
+            row["QUANTIDADE"], row["UNIDADE DE MEDIDA"]
+        ),
         axis=1,
     )
     filtered_df["QUANTIDADE"] = normalized_measure.map(lambda item: item[0])
@@ -215,77 +311,31 @@ def build_receitas_export(
     email: str,
     csv_input,
     template_xlsx_path: Path = RECEITAS_TEMPLATE_PATH,
-    receitas_master_path: Path = RECEITAS_MASTER_PATH,
 ) -> pd.DataFrame:
     template_columns = load_template_columns(template_xlsx_path)
     source_df = read_csv_input(csv_input)
-    receitas_master_df = pd.read_csv(receitas_master_path, dtype=str)
-    source_df = ensure_columns(
-        source_df,
-        [
-            "usuario_email",
-            "receita_id",
-            "insumo_receita_itens",
-            "nome",
-            "nome copy",
-            "quantidade",
-        ],
-    )
-    receitas_master_df = ensure_columns(
-        receitas_master_df,
-        ["🔒 Row ID", "nome", "preco_venda", "rendimento_receita", "status"],
-    )
-
+    validate_receitas_columns(source_df)
     filtered_df = source_df[
-        source_df["usuario_email"].fillna("").str.lower() == normalize_email(email)
+        source_df["RECEITA"].fillna("").map(normalize_text) != ""
     ].copy()
-
-    filtered_df = filtered_df[
-        filtered_df["receita_id"].notna() & filtered_df["insumo_receita_itens"].notna()
-    ].copy()
-
-    if filtered_df.empty:
-        return pd.DataFrame(columns=template_columns)
-
-    receitas_master_df = receitas_master_df.rename(columns={"🔒 Row ID": "receita_id"})
-    receitas_master_df = receitas_master_df.drop_duplicates(subset=["receita_id"], keep="first")
-    filtered_df = filtered_df.merge(
-        receitas_master_df[
-            ["receita_id", "nome", "preco_venda", "rendimento_receita", "status"]
-        ].rename(
-            columns={
-                "nome": "receita_nome",
-                "preco_venda": "receita_preco_venda",
-                "rendimento_receita": "receita_rendimento",
-                "status": "receita_status",
-            }
-        ),
-        on="receita_id",
-        how="left",
-    )
-
-    filtered_df["item_name"] = filtered_df["nome copy"].where(
-        filtered_df["nome copy"].notna() & (filtered_df["nome copy"].str.strip() != ""),
-        filtered_df["insumo_receita_itens"],
-    )
-    filtered_df["item_name"] = filtered_df["item_name"].fillna(filtered_df["nome"]).map(normalize_text)
-    filtered_df["item_quantity"] = filtered_df["quantidade"].map(parse_number)
 
     rows = []
-    for _, group in filtered_df.groupby("receita_id", sort=False):
+    for _, source_row in filtered_df.iterrows():
         row = {column: pd.NA for column in template_columns}
         row["App user email"] = normalize_email(email)
-        first_item = group.iloc[0]
-        row["RECEITA"] = normalize_text(first_item.get("receita_nome"))
-        row["PREÇO DE VENDA"] = parse_number(first_item.get("receita_preco_venda"))
-        row["RENDIMENTO DA RECEITA"] = parse_number(first_item.get("receita_rendimento"))
-        status_value = normalize_text(first_item.get("receita_status"))
-        row["STATUS"] = parse_number(status_value) if status_value else pd.NA
+        row["RECEITA"] = normalize_text(source_row.get("RECEITA"))
+        row["STATUS"] = parse_status(source_row.get("STATUS"))
+        row["PREÇO DE VENDA"] = parse_number(source_row.get("PREÇO DE VENDA"))
+        row["RENDIMENTO DA RECEITA"] = parse_number(
+            source_row.get("RENDIMENTO DA RECEITA")
+        )
 
-        for index, (_, item) in enumerate(group.head(MAX_RECEITA_ITEMS).iterrows(), start=1):
-            row[f"INSUMO {index}"] = item["item_name"]
+        for index in range(1, MAX_RECEITA_ITEMS + 1):
             quantity_column = "QND USADA 1" if index == 1 else f"QNT USADA {index}"
-            row[quantity_column] = item["item_quantity"]
+            item_name = normalize_text(source_row.get(f"INSUMO {index}"))
+            if item_name:
+                row[f"INSUMO {index}"] = item_name
+            row[quantity_column] = parse_number(source_row.get(quantity_column))
 
         rows.append(row)
 
@@ -299,9 +349,13 @@ def render_download_section(
     dataframe: pd.DataFrame,
     output_name: str,
     download_label: str,
+    warnings: list[str] | None = None,
 ) -> None:
     st.subheader(title)
     st.write(description)
+
+    for warning in warnings or []:
+        st.warning(warning)
 
     if dataframe.empty:
         st.warning("Nenhum registro encontrado para este email.")
@@ -324,8 +378,7 @@ def main() -> None:
     st.write(APP_DESCRIPTION)
     st.caption(f"Pandas configurado: `{pd.__version__}`")
     st.info(
-        "Cada aba funciona sozinha. `Receitas` precisa de 2 arquivos CSV. "
-        "`Insumos` precisa de 1 arquivo CSV."
+        "Cada aba funciona sozinha e recebe 1 arquivo CSV no formato novo."
     )
 
     email = st.text_input("Email do usuário", placeholder="usuario@dominio.com")
@@ -339,44 +392,38 @@ def main() -> None:
 
     with receitas_tab:
         st.markdown("**Arquivos obrigatórios desta aba**")
-        st.write("1. CSV de itens da receita. Nome esperado: `receita_itens.csv`")
-        st.write("2. CSV mestre de receitas. Nome esperado: `receita_valores.csv`")
+        st.write("CSV de receitas. Exemplo: `RECEITAS.csv`")
 
         receitas_file = st.file_uploader(
-            "CSV de itens da receita (`receita_itens.csv`)",
+            "CSV de receitas (`RECEITAS.csv`)",
             type=["csv"],
             accept_multiple_files=False,
             key="receitas-csv",
         )
-        receitas_master_file = st.file_uploader(
-            "CSV mestre de receitas (`receita_valores.csv`)",
-            type=["csv"],
-            accept_multiple_files=False,
-            key="receitas-master-csv",
-        )
-        if receitas_file is None or receitas_master_file is None:
-            st.warning("Para gerar `Receitas`, envie os 2 CSVs desta aba.")
+        if receitas_file is None:
+            st.info("Envie CSV de receitas.")
         else:
-            receitas_df = build_receitas_export(
-                normalized_email,
-                receitas_file,
-                receitas_master_path=receitas_master_file,
-            )
-            render_download_section(
-                title="Receitas",
-                description=(
-                    "CSVs enviados -> modelo `assets/receitas modelo.xlsx`"
-                ),
-                dataframe=receitas_df,
-                output_name="receitas_revisadas.xlsx",
-                download_label="Baixar receitas em XLSX",
-            )
+            try:
+                receitas_source_df = read_csv_input(receitas_file)
+                receitas_df = build_receitas_export(normalized_email, receitas_file)
+                receitas_warnings = find_receitas_warnings(receitas_source_df)
+            except InputSchemaError as error:
+                st.error(str(error))
+            else:
+                render_download_section(
+                    title="Receitas",
+                    description="CSV enviado -> modelo `assets/receitas modelo.xlsx`",
+                    dataframe=receitas_df,
+                    output_name="receitas_revisadas.xlsx",
+                    download_label="Baixar receitas em XLSX",
+                    warnings=receitas_warnings,
+                )
 
     with insumos_tab:
         st.markdown("**Arquivo obrigatório desta aba**")
-        st.write("CSV de insumos/subprodutos. Nome esperado: `insumos_subprodutos.csv`")
+        st.write("CSV de insumos. Exemplo: `INSUMOS.csv`")
         insumos_file = st.file_uploader(
-            "CSV de insumos (`insumos_subprodutos.csv`)",
+            "CSV de insumos (`INSUMOS.csv`)",
             type=["csv"],
             accept_multiple_files=False,
             key="insumos-csv",
@@ -384,14 +431,21 @@ def main() -> None:
         if insumos_file is None:
             st.info("Envie CSV de insumos.")
         else:
-            insumos_df = build_insumos_export(normalized_email, insumos_file)
-            render_download_section(
-                title="Insumos",
-                description=("CSV enviado -> modelo `assets/insumos.xlsx`"),
-                dataframe=insumos_df,
-                output_name="insumos_revisados.xlsx",
-                download_label="Baixar insumos em XLSX",
-            )
+            try:
+                insumos_source_df = read_csv_input(insumos_file)
+                insumos_df = build_insumos_export(normalized_email, insumos_file)
+                insumos_warnings = find_insumos_warnings(insumos_source_df)
+            except InputSchemaError as error:
+                st.error(str(error))
+            else:
+                render_download_section(
+                    title="Insumos",
+                    description="CSV enviado -> modelo `assets/insumos.xlsx`",
+                    dataframe=insumos_df,
+                    output_name="insumos_revisados.xlsx",
+                    download_label="Baixar insumos em XLSX",
+                    warnings=insumos_warnings,
+                )
 
 
 if __name__ == "__main__":
